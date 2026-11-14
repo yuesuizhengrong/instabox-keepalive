@@ -1,0 +1,27 @@
+name: InstaBox keepalive
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping or start ergou-box
+        env:
+          KEY: ${{ secrets.INSTABOX_API_KEY }}
+        run: |
+          MACH=m_agqztvrxmv3mbljq5rof7qekha
+          if curl -sf --max-time 20 -X POST "https://api.instabox.sh/v1/machines/$MACH/exec" \
+              -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+              -d '{"cmd":"date +%s"}' > /dev/null; then
+            echo "running, ping ok"
+          else
+            echo "ping failed, starting box..."
+            curl -sf --max-time 90 -X POST "https://api.instabox.sh/v1/machines/$MACH/start" \
+              -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+              -H "Idempotency-Key: keepalive-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              -d '{}'
+            echo "start triggered"
+          fi
