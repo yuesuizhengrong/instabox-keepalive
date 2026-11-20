@@ -1,27 +1,74 @@
 name: InstaBox keepalive
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '30 14 * * *'   # 每日一次"点火"种子（UTC，自带新鲜度检查防重复）
   workflow_dispatch:
+    inputs:
+      chain:
+        description: '手动点火请填 go'
+        default: ''
+  repository_dispatch:
+    types: [chain]          # 上一轮循环结束时自动接力触发
+
+permissions:
+  contents: write           # dispatches API 需要
+  actions: read             # 查询历史运行需要
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
 
 jobs:
   keepalive:
+    if: github.event_name == 'repository_dispatch' || github.event_name == 'schedule' || github.event.inputs.chain == 'go'
     runs-on: ubuntu-latest
+    timeout-minutes: 335
     steps:
-      - name: Ping or start ergou-box
+      - name: Keepalive loop (~5.5h, ping every 5min, chain next run)
         env:
           KEY: ${{ secrets.INSTABOX_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           MACH=m_agqztvrxmv3mbljq5rof7qekha
-          if curl -sf --max-time 20 -X POST "https://api.instabox.sh/v1/machines/$MACH/exec" \
-              -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-              -d '{"cmd":"date +%s"}' > /dev/null; then
-            echo "running, ping ok"
-          else
-            echo "ping failed, starting box..."
-            curl -sf --max-time 90 -X POST "https://api.instabox.sh/v1/machines/$MACH/start" \
-              -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-              -H "Idempotency-Key: keepalive-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-              -d '{}'
-            echo "start triggered"
+
+          # 种子运行的新鲜度检查：6 小时内已有成功收工的运行 → 接力链还活着，秒退防积压
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            RECENT=$(curl -sf --max-time 30 \
+              "https://api.github.com/repos/$REPO/actions/runs?status=success&per_page=1" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              | python3 -c "import json,sys,datetime;d=json.load(sys.stdin);r=d['workflow_runs'][0] if d['workflow_runs'] else None;print('yes' if r and (datetime.datetime.utcnow()-datetime.datetime.fromisoformat(r['run_started_at'].replace('Z','+00:00')).replace(tzinfo=None))<datetime.timedelta(hours=6) else 'no')" 2>/dev/null || echo no)
+            if [ "$RECENT" = "yes" ]; then
+              echo "chain still alive (recent success <6h), seed exits"
+              exit 0
+            fi
+            echo "no recent success, seed takes over"
           fi
+
+          END=$(( $(date +%s) + 315*60 ))   # 315 分钟后收工接力
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if curl -sf --max-time 20 -X POST "https://api.instabox.sh/v1/machines/$MACH/exec" \
+                -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+                -d '{"cmd":"date +%s"}' > /dev/null 2>&1; then
+              echo "$(date -u +%H:%M:%S) ping ok"
+            else
+              echo "$(date -u +%H:%M:%S) ping failed, starting box..."
+              curl -sf --max-time 90 -X POST "https://api.instabox.sh/v1/machines/$MACH/start" \
+                -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+                -H "Idempotency-Key: ka-$GITHUB_RUN_ID-$(date +%s)" \
+                -d '{}' > /dev/null 2>&1 \
+                || echo "$(date -u +%H:%M:%S) start attempt failed (will retry)"
+            fi
+            sleep 300
+          done
+
+          # 收工 → 拉起下一轮接力
+          echo "loop done, chaining next run..."
+          sleep 20
+          curl -sf --max-time 30 -X POST \
+            "https://api.github.com/repos/$REPO/dispatches" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"event_type":"chain","client_payload":{"chain":"go"}}' \
+            && echo "next run dispatched"
